@@ -254,9 +254,6 @@ def cl_forward(cls,
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
         cos_sim = torch.cat([cos_sim, z1_z3_cos], 1)
 
-    
-    
-
     # Calculate loss with hard negatives
     if num_sent == 3:
         # Note that weights are actually logits of weights
