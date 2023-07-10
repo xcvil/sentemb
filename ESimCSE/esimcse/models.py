@@ -264,8 +264,6 @@ def cl_forward(cls,
         cos_sim = cos_sim + weights
 
     loss = loss_fct(cos_sim, labels)
-    
-    #import ipdb;ipdb.set_trace()
 
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
