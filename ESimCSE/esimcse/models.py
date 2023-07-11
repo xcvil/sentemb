@@ -16,6 +16,7 @@ from transformers.file_utils import (
 )
 from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
 
+
 class MLPLayer(nn.Module):
     """
     Head for getting sentence representations over RoBERTa/BERT's CLS representation.
@@ -31,6 +32,26 @@ class MLPLayer(nn.Module):
         x = self.activation(x)
 
         return x
+
+
+class ClusterHead(nn.Module):
+    """
+    Head for getting sentence representations over RoBERTa/BERT's CLS representation.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.activation = nn.ReLU()
+        self.dense2 = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def forward(self, features, **kwargs):
+        x = self.dense(features)
+        x = self.activation(x)
+        x = self.dense2(x)
+
+        return x
+
 
 class Similarity(nn.Module):
     """
@@ -83,6 +104,32 @@ class Pooler(nn.Module):
             raise NotImplementedError
 
 
+def grouping(features_groupDis1, features_groupDis2, T=0.05, config=None):
+    # print(features_groupDis1.size())
+    criterion = nn.CrossEntropyLoss().cuda()
+    # K-way normalized cuts or k-Means. Default: k-Means
+    # if config.use_kmeans:
+        # cluster_label1, centroids1 = KMeans(features_groupDis1, K=config.clusters, Niters=config.num_iters)
+        # cluster_label2, centroids2 = KMeans(features_groupDis2, K=config.clusters, Niters=config.num_iters)
+    if True:
+        cluster_label1, centroids1 = KMeans(features_groupDis1, K=4, Niters=100)
+        cluster_label2, centroids2 = KMeans(features_groupDis2, K=4, Niters=100)
+    else:
+        cluster_label1, centroids1 = spectral_clustering(features_groupDis1, K=config.k_eigen,
+                    clusters=config.clusters, Niters=config.num_iters)
+        cluster_label2, centroids2 = spectral_clustering(features_groupDis2, K=config.k_eigen,
+                    clusters=config.clusters, Niters=config.num_iters)
+
+    # group discriminative learning
+    affnity1 = torch.mm(features_groupDis1, centroids2.t())
+    CLD_loss = criterion(affnity1.div_(T), cluster_label2)
+
+    affnity2 = torch.mm(features_groupDis2, centroids1.t())
+    CLD_loss = (CLD_loss + criterion(affnity2.div_(T), cluster_label1))/2
+
+    return CLD_loss
+
+
 def cl_init(cls, config):
     """
     Contrastive learning class init function.
@@ -90,6 +137,7 @@ def cl_init(cls, config):
     cls.pooler_type = cls.model_args.pooler_type
     cls.pooler = Pooler(cls.model_args.pooler_type)
     cls.mlp = MLPLayer(config)
+    cls.cluster_head = ClusterHead(config)
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
 
