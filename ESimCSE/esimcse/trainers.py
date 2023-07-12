@@ -449,7 +449,8 @@ class CLTrainer(Trainer):
             inputs = None
             last_inputs = None
 
-            self.pre_z1=None
+            self.pre_z1 = None
+            self.pre_zc1 = None
             
             for step, inputs in enumerate(epoch_iterator):
 
@@ -562,6 +563,7 @@ class CLTrainer(Trainer):
         self._total_loss_scalar += tr_loss.item()
 
         return TrainOutput(self.state.global_step, self._total_loss_scalar / self.state.global_step, metrics)
+
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -621,21 +623,26 @@ class CLTrainer(Trainer):
             model.train()
             inputs['disable_dropout'] = False
             inputs['pre_z1'] = self.pre_z1
+            inputs['pre_zc1'] = self.pre_zc1
             outputs = model(**inputs)
 
+            # queue updates
             model.eval()
             with torch.no_grad():
                 inputs['disable_dropout'] = True
-                eval_z = model(**inputs)
+                eval_z, eval_zc = model(**inputs)
             #import ipdb;ipdb.set_trace()
             if self.pre_z1 == None:
                 self.pre_z1 = eval_z.clone() 
+                self.pre_zc1 = eval_zc.clone() 
             else :
                 now_neg_size = -self.model_args.neg_size
                 
-                self.pre_z1 = torch.cat((self.pre_z1, eval_z.clone()),0)[now_neg_size:]   
+                self.pre_z1 = torch.cat((self.pre_z1, eval_z.clone()),0)[now_neg_size:]
+                self.pre_zc1 = torch.cat((self.pre_zc1, eval_zc.clone()),0)[now_neg_size:]   
         else:
             inputs['pre_z1'] = None
+            inputs['pre_zc1'] = None
             outputs = model(**inputs)
         #import ipdb;ipdb.set_trace()
         # Save past state if it exists

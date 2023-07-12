@@ -15,6 +15,7 @@ from transformers.file_utils import (
     replace_return_docstrings,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
+from .spectral_clustering import spectral_clustering, pairwise_cosine_similarity, KMeans
 
 
 class MLPLayer(nn.Module):
@@ -104,30 +105,45 @@ class Pooler(nn.Module):
             raise NotImplementedError
 
 
-def grouping(features_groupDis1, features_groupDis2, T=0.05, config=None):
+def grouping(cls, features_groupDis1, features_groupDis2, pre_zc1=None):
     # print(features_groupDis1.size())
     criterion = nn.CrossEntropyLoss().cuda()
     # K-way normalized cuts or k-Means. Default: k-Means
     # if config.use_kmeans:
         # cluster_label1, centroids1 = KMeans(features_groupDis1, K=config.clusters, Niters=config.num_iters)
         # cluster_label2, centroids2 = KMeans(features_groupDis2, K=config.clusters, Niters=config.num_iters)
-    if True:
-        cluster_label1, centroids1 = KMeans(features_groupDis1, K=4, Niters=100)
-        cluster_label2, centroids2 = KMeans(features_groupDis2, K=4, Niters=100)
+    if pre_zc1 != None:
+        if cls.model_args.use_kmeans:
+            cluster_label1, centroids1 = KMeans(torch.cat((features_groupDis1, pre_zc1),0), K=cls.model_args.clusters, Niters=cls.model_args.num_iters)
+            # cluster_label2, centroids2 = KMeans(torch.cat((features_groupDis2, pre_zc1),0), K=cls.model_args.clusters, Niters=cls.model_args.num_iters)
+
+        # group discriminative learning
+        # affnity1 = torch.mm(features_groupDis1, centroids2.t())
+        # CLD_loss = criterion(affnity1.div_(cls.model_args.cluster_t), cluster_label2[:affnity1.shape[0]])
+
+        affnity2 = torch.mm(features_groupDis2, centroids1.t())
+        CLD_loss = criterion(affnity2.div_(cls.model_args.cluster_t), cluster_label1[:affnity2.shape[0]])
+
+        return CLD_loss
+    
     else:
-        cluster_label1, centroids1 = spectral_clustering(features_groupDis1, K=config.k_eigen,
-                    clusters=config.clusters, Niters=config.num_iters)
-        cluster_label2, centroids2 = spectral_clustering(features_groupDis2, K=config.k_eigen,
-                    clusters=config.clusters, Niters=config.num_iters)
+        if cls.model_args.use_kmeans:
+            cluster_label1, centroids1 = KMeans(features_groupDis1, K=cls.model_args.clusters, Niters=cls.model_args.num_iters)
+            cluster_label2, centroids2 = KMeans(features_groupDis2, K=cls.model_args.clusters, Niters=cls.model_args.num_iters)
+        else:
+            cluster_label1, centroids1 = spectral_clustering(features_groupDis1, K=cls.model_args.k_eigen,
+                        clusters=cls.model_args.clusters, Niters=cls.model_args.num_iters)
+            cluster_label2, centroids2 = spectral_clustering(features_groupDis2, K=cls.model_args.k_eigen,
+                        clusters=cls.model_args.clusters, Niters=cls.model_args.num_iters)
 
-    # group discriminative learning
-    affnity1 = torch.mm(features_groupDis1, centroids2.t())
-    CLD_loss = criterion(affnity1.div_(T), cluster_label2)
+        # group discriminative learning
+        affnity1 = torch.mm(features_groupDis1, centroids2.t())
+        CLD_loss = criterion(affnity1.div_(cls.model_args.cluster_t), cluster_label2)
 
-    affnity2 = torch.mm(features_groupDis2, centroids1.t())
-    CLD_loss = (CLD_loss + criterion(affnity2.div_(T), cluster_label1))/2
+        affnity2 = torch.mm(features_groupDis2, centroids1.t())
+        CLD_loss = (CLD_loss + criterion(affnity2.div_(cls.model_args.cluster_t), cluster_label1))/2
 
-    return CLD_loss
+        return CLD_loss
 
 
 def cl_init(cls, config):
@@ -155,7 +171,8 @@ def cl_forward(cls,
     return_dict=None,
     mlm_input_ids=None,
     mlm_labels=None,
-    pre_z1=None,
+    pre_z1=None, #todo pre_z1 shape: bs x 2 x hidden -> bs x [pre_z1, pre_zc1] x hidden
+    pre_zc1=None,
     disable_dropout=False,
     momentum = 0.
 ):
@@ -190,7 +207,7 @@ def cl_forward(cls,
         # Flatten input for encoding
         raw_input_ids = input_ids[:,0,:]
         input_ids = input_ids.view((-1, input_ids.size(-1))) # (bs * num_sent, len)
-        attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent len)
+        attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent, len)
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
 
@@ -229,28 +246,40 @@ def cl_forward(cls,
 
     # Pooling
     pooler_output = cls.pooler(attention_mask, outputs)
+    # print(f'output size {pooler_output.shape}')
     pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
-
+    # print(pooler_output.shape)
     # If using "cls", we add an extra MLP layer
     # (same as BERT's original implementation) over the representation.
     if cls.pooler_type == "cls":
-        pooler_output = cls.mlp(pooler_output)
+        cl_embedding = cls.mlp(pooler_output)
+    else:
+        cl_embedding = pooler_output
+
+    cluster_embedding = cls.cluster_head(pooler_output)
 
     if disable_dropout and momentum > 0. :
-        return pooler_output[:,0].clone().detach()
-
+        # update cluster embedding queue with normlization
+        temp = nn.functional.normalize(cluster_embedding[:,0], dim=1)
+        # return torch.cat((cl_embedding[:,0].unsqueeze(1).clone().detach(), cluster_embedding[:,0].unsqueeze(1).clone().detach()),1)
+        return cl_embedding[:,0].clone().detach(), temp.clone().detach()
+    
     # Separate representation
-    z1, z2 = pooler_output[:,0], pooler_output[:,1]
+    z1, z2 = cl_embedding[:,0], cl_embedding[:,1]
+    # Separate representation
+    zc1, zc2 = cluster_embedding[:,0], cluster_embedding[:,1]
+    zc1, zc2 = nn.functional.normalize(zc1, dim=1), nn.functional.normalize(zc2, dim=1)
 
     if disable_dropout:
-        return z1.clone().detach()
+        # return torch.cat((z1.unsqueeze(1).clone().detach(), zc1.unsqueeze(1).clone().detach()),1)
+        return z1.clone().detach(), zc1.clone().detach()
 
-    z1_temp = z1.clone().detach()
+    # z1_temp = z1.clone().detach()
     # z2_temp = z2.clone().detach()
     
     # Hard negative
     if num_sent == 3:
-        z3 = pooler_output[:, 2]
+        z3 = cl_embedding[:, 2]
 
     # Gather all embeddings if using distributed training
     if dist.is_initialized() and cls.training:
@@ -275,7 +304,22 @@ def cl_forward(cls,
         # Get full batch embeddings: (bs x N, hidden)
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
-    #print
+
+        # Dummy vectors for allgather
+        zc1_list = [torch.zeros_like(zc1) for _ in range(dist.get_world_size())]
+        zc2_list = [torch.zeros_like(zc2) for _ in range(dist.get_world_size())]
+        # Allgather
+        dist.all_gather(tensor_list=zc1_list, tensor=zc1.contiguous())
+        dist.all_gather(tensor_list=zc2_list, tensor=zc2.contiguous())
+
+        # Since allgather results do not have gradients, we replace the
+        # current process's corresponding embeddings with original tensors
+        zc1_list[dist.get_rank()] = zc1
+        zc2_list[dist.get_rank()] = zc2
+        # Get full batch embeddings: (bs x N, hidden)
+        zc1 = torch.cat(zc1_list, 0)
+        zc2 = torch.cat(zc2_list, 0)
+
     cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))
     # cos_sim_2 = cls.sim(z2.unsqueeze(1), z1.unsqueeze(0))
 
@@ -288,15 +332,7 @@ def cl_forward(cls,
     #     cos_sim = torch.cat((cos_sim,cls.sim(z1.unsqueeze(1), cls.pre_neg.unsqueeze(0))),1).to(cls.device)
     loss_fct = nn.CrossEntropyLoss()
     labels = torch.arange(cos_sim.size(0)).long().to(cls.device)
-    
-    if pre_z1!=None:
-        pre_z1=pre_z1.to(cls.device)
-        #import ipdb;ipdb.set_trace()
-        cos_sim_neg = torch.cat((cos_sim, cls.sim(z1.unsqueeze(1), pre_z1.unsqueeze(0))),1).to(cls.device)
-        loss_neg = loss_fct(cos_sim_neg, labels)
-        #cos_sim_neg = torch.cat((cos_sim_2,cls.sim(z2.unsqueeze(1), pre_z1.unsqueeze(0))),1).to(cls.device)
-        #loss_neg += loss_fct(cos_sim_neg, labels)
-        #loss_neg *= 0.5
+
     # Hard negative
     if num_sent >= 3:
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
@@ -311,8 +347,20 @@ def cl_forward(cls,
         ).to(cls.device)
         cos_sim = cos_sim + weights
 
-    loss = loss_fct(cos_sim, labels)
-
+    # calculate MoCo Loss
+    if pre_z1 != None: 
+        pre_z1 = pre_z1.to(cls.device)
+        pre_zc1 = pre_zc1.to(cls.device)
+        #import ipdb;ipdb.set_trace()
+        cos_sim_neg = torch.cat((cos_sim, cls.sim(z1.unsqueeze(1), pre_z1.unsqueeze(0))),1).to(cls.device)
+        loss_neg = loss_fct(cos_sim_neg, labels)
+        # cos_sim_neg = torch.cat((cos_sim_2,cls.sim(z2.unsqueeze(1), pre_z1.unsqueeze(0))),1).to(cls.device)
+        # loss_neg += loss_fct(cos_sim_neg, labels)
+        # loss_neg *= 0.5
+        loss = loss_neg + cls.model_args.cluster_loss_lambda * grouping(cls, zc1, zc2, pre_zc1)
+    else:
+        loss = loss_fct(cos_sim, labels) + cls.model_args.cluster_loss_lambda * grouping(cls, zc1, zc2)
+    
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
         mlm_labels = mlm_labels.view(-1, mlm_labels.size(-1))
@@ -324,12 +372,8 @@ def cl_forward(cls,
         output = (cos_sim,) + outputs[2:]
         return ((loss,) + output) if loss is not None else output
     
-    if pre_z1!=None:
-        loss_final=loss_neg
-    else:
-        loss_final= loss
     return SequenceClassifierOutput(
-        loss=loss_final,
+        loss=loss,
         logits=cos_sim,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
@@ -411,6 +455,7 @@ class BertForCL(BertPreTrainedModel):
         mlm_input_ids=None,
         mlm_labels=None,
         pre_z1=None,
+        pre_zc1=None,
         disable_dropout=False,
         momentum = 0.
     ):
@@ -442,6 +487,7 @@ class BertForCL(BertPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
                 pre_z1=pre_z1,
+                pre_zc1=pre_zc1,
                 disable_dropout=disable_dropout,
                 momentum = momentum
             )
@@ -480,6 +526,7 @@ class RobertaForCL(RobertaPreTrainedModel):
         mlm_input_ids=None,
         mlm_labels=None,
         pre_z1=None,
+        pre_zc1=None,
         disable_dropout=False,
         momentum=0.
     ):
@@ -511,6 +558,7 @@ class RobertaForCL(RobertaPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
                 pre_z1=pre_z1, 
+                pre_zc1=pre_zc1, 
                 disable_dropout=disable_dropout,
                 momentum=momentum
             )
